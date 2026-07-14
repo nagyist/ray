@@ -257,7 +257,7 @@ class DataIterator(abc.ABC):
                 executor,
             ) = self._to_ref_bundle_iterator()
 
-            dataset_tag = self._get_dataset_tag()
+            dataset_tags = self._get_dataset_tag()
 
             # Create a callback to report prefetched bytes to the executor's
             # resource manager.
@@ -277,7 +277,7 @@ class DataIterator(abc.ABC):
             batch_iterator = self._create_batch_iterator(
                 ref_bundles_iterator,
                 stats=stats,
-                dataset_tag=dataset_tag,
+                dataset_tags=dataset_tags,
                 clear_block_after_read=blocks_owned_by_consumer,
                 batch_size=batch_size,
                 batch_format=batch_format,
@@ -303,7 +303,11 @@ class DataIterator(abc.ABC):
                 try:
                     if stats:
                         stats.iter_total_s.add(time.perf_counter() - time_start)
-                        _StatsManager.update_iteration_metrics(stats, dataset_tag)
+                        _StatsManager.update_iteration_metrics(
+                            stats,
+                            dataset_tags["dataset"],
+                            dataset_tags["split_index"],
+                        )
                 finally:
                     # On early exit (e.g. ``break`` in the for-loop), the
                     # inner ``_ClosingIterator`` would only shut down the
@@ -316,8 +320,20 @@ class DataIterator(abc.ABC):
 
         return _IterableFromIterator(_create_iterator)
 
-    def _get_dataset_tag(self) -> str:
-        return "unknown_dataset"
+    def _get_dataset_tag(self) -> Dict[str, Optional[str]]:
+        """Metrics tags applied to this iterator's ``data_iter_*`` metrics.
+
+        Returns a dict with keys matching ``iter_tag_keys``:
+
+        - ``dataset``: the dataset id.
+        - ``split_index``: the output split index for stream-split iterators, or
+          ``None`` for plain iterators (which have no split dimension). ``None``
+          is coerced to the ``"no_split"`` label downstream so plain-iterator
+          metrics collapse to a single series.
+
+        Subclasses override this to supply the real dataset id and split index.
+        """
+        return {"dataset": "unknown_dataset", "split_index": None}
 
     @PublicAPI
     def iter_rows(self) -> Iterable[Dict[str, Any]]:
