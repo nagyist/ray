@@ -32,6 +32,7 @@ from ray.data.collate_fn import (
     PandasBatchCollateFn,
     TensorBatchReturnType,
     TensorBatchType,
+    _PinMemoryCollateFnWrapper,
     is_tensor_batch_type,
 )
 from ray.data.context import DataContext
@@ -484,9 +485,11 @@ class DataIterator(abc.ABC):
                 3. pd.DataFrame, where you should provide a callable class that
                    subclasses `PandasBatchCollateFn`
 
-                The output can be any type. If the output is a `TensorBatchType`, it will be
-                automatically moved to the current worker's device. For other types,
-                you must handle device transfer manually in your training loop.
+                The output can be any type. Return a non-pinned `TensorBatchType` to
+                get managed memory pinning (see ``pin_memory``) and transfer to the
+                current worker's device. Any other output type means you must
+                handle device transfer manually in your training loop (consider using
+                :meth:`~ray.data.DataIterator.iter_batches` instead).
                 Note: This function is called in a multi-threaded context; avoid using
                 thread-unsafe code.
             drop_last: Whether to drop the last batch if it's incomplete.
@@ -499,12 +502,14 @@ class DataIterator(abc.ABC):
                 therefore ``batch_size`` must also be specified when using local
                 shuffling.
             local_shuffle_seed: The seed to use for the local random shuffle.
-            pin_memory: [Alpha] If True, copies the tensor to pinned memory. Note that
-                `pin_memory` is only supported when using `DefaultCollateFn`.
+            pin_memory: [Alpha] Pin memory if True and the `collate_fn` output is a
+                `TensorBatchType`. It is recommended to use this flag to pin
+                memory instead of manually pinning memory in the `collate_fn`.
 
         Returns:
             An iterable over Torch Tensor batches.
         """
+        from torch import device as torch_device
 
         from ray.train.torch import get_device
         from ray.train.utils import _in_ray_train_worker
@@ -516,15 +521,11 @@ class DataIterator(abc.ABC):
                 "desired dtype and device outside of collate_fn."
             )
 
-        if pin_memory and collate_fn is not None:
-            raise ValueError(
-                "pin_memory is only supported when using `DefaultCollateFn`."
-            )
-
         if device == "auto":
             # Use the appropriate device for Ray Train, or falls back to CPU if
             # Ray Train is not being used.
             device = get_device() if _in_ray_train_worker() else "cpu"
+        device = torch_device(device)
 
         from ray.data.util.torch_utils import (
             move_tensors_to_device,
@@ -559,10 +560,17 @@ class DataIterator(abc.ABC):
             # The default collate_fn handles formatting and Tensor creation.
             # Here, we defer host to device data transfer to the subsequent
             # finalize_fn.
+            # For GPU transfer, we can skip combining the chunked arrays. This is
+            # because we can convert the chunked arrays to the corresponding numpy
+            # format and then to Tensors and transfer the corresponding list of
+            # Tensors to GPU directly. However, for CPU transfer, we need to
+            # combine the chunked arrays first before converting to numpy format
+            # and then to Tensors.
+
+            combine_chunks = device.type == "cpu"
             collate_fn = DefaultCollateFn(
                 dtypes=dtypes,
-                device=device,
-                pin_memory=pin_memory,
+                combine_chunks=combine_chunks,
             )
             batch_format = "pyarrow"
         elif isinstance(collate_fn, ArrowBatchCollateFn):
@@ -585,6 +593,9 @@ class DataIterator(abc.ABC):
             )
         else:
             raise ValueError(f"Unsupported collate function: {type(collate_fn)}")
+
+        if pin_memory:
+            collate_fn = _PinMemoryCollateFnWrapper(collate_fn)
 
         return self._iter_batches(
             prefetch_batches=prefetch_batches,
